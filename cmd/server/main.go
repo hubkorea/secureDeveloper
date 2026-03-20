@@ -11,7 +11,10 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	log "github.com/sirupsen/logrus"
 	_ "modernc.org/sqlite"
+
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 const authorizationCookieName = "authorization"
@@ -110,6 +113,28 @@ type SessionStore struct {
 	tokens map[string]User
 }
 
+func initLogger() {
+	log.SetOutput(&lumberjack.Logger{
+		Filename:   "./logs/api.log",
+		MaxSize:    1,
+		MaxBackups: 5,
+		MaxAge:     30,
+		Compress:   false,
+	})
+}
+
+func JSONLogger() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		log.WithFields(log.Fields{
+			"ip":     c.ClientIP(),
+			"method": c.Request.Method,
+			"path":   c.Request.URL.Path,
+			"status": c.Writer.Status(),
+		}).Info("요청 수신")
+		c.Next()
+	}
+}
+
 func main() {
 	store, err := openStore("./app.db", "./schema.sql", "./seed.sql")
 	if err != nil {
@@ -122,6 +147,10 @@ func main() {
 	router := gin.Default()
 	registerStaticRoutes(router)
 
+	initLogger()
+	router.Use(JSONLogger())
+	log.Info("서버 시작")
+
 	auth := router.Group("/api/auth")
 	{
 		auth.POST("/register", func(c *gin.Context) {
@@ -130,10 +159,31 @@ func main() {
 				c.JSON(http.StatusBadRequest, gin.H{"message": "invalid register request"})
 				return
 			}
+			Username := strings.TrimSpace(request.Username)
+			Name := strings.TrimSpace(request.Name)
+			Email := strings.TrimSpace(request.Email)
+			Phone := strings.TrimSpace(request.Phone)
+			Password := strings.TrimSpace(request.Password)
+
+			if Username == "" || Name == "" || Email == "" || Phone == "" || Password == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"message": "all fields are required"})
+				return
+			}
+
+			_, err := store.db.Exec("INSERT INTO users (username, name, email, phone, password) VALUES (?, ?, ?, ?, ?)",
+				Username,
+				Name,
+				Email,
+				Phone,
+				Password,
+			)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to create user"})
+				return
+			}
 
 			c.JSON(http.StatusAccepted, gin.H{
-				"message": "dummy register handler",
-				"todo":    "replace with actual signup validation and insert query",
+
 				"user": gin.H{
 					"username": request.Username,
 					"name":     request.Name,
@@ -150,7 +200,7 @@ func main() {
 				return
 			}
 
-			user, ok, err := store.findUserByUsername(request.Username)
+			user, ok, err := store.findUserByUsername(request.Username) // 반환값: 사용자, 있는지 여부, 에러 여부
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to load user"})
 				return
@@ -189,8 +239,7 @@ func main() {
 			sessions.delete(token)
 			clearAuthorizationCookie(c)
 			c.JSON(http.StatusOK, gin.H{
-				"message": "dummy logout handler",
-				"todo":    "replace with revoke or audit logic if needed",
+				"message": "logout completed",
 			})
 		})
 
@@ -212,15 +261,27 @@ func main() {
 				return
 			}
 
+			// db 삭제 후 세션 삭제
+			if sessions.tokens[token].Password != request.Password {
+				c.JSON(http.StatusUnauthorized, gin.H{"message": "wrong password"})
+				return
+			}
+			_, err := store.db.Exec("DELETE FROM users WHERE password = ?", request.Password)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to delete account"})
+				return
+			}
+			sessions.delete(token)
+			clearAuthorizationCookie(c)
+
 			c.JSON(http.StatusAccepted, gin.H{
-				"message": "dummy withdraw handler",
-				"todo":    "replace with password check and account delete logic",
+				"message": "회원 삭제 완료",
 				"user":    makeUserResponse(user),
 			})
 		})
 	}
 
-	protected := router.Group("/api")
+	protected := router.Group("/api") // db에서 셀렉 or 로깅 등
 	{
 		protected.GET("/me", func(c *gin.Context) {
 			token := tokenFromRequest(c)
@@ -255,10 +316,25 @@ func main() {
 				return
 			}
 
+			if request.Amount <= 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"message": "입금 금액은 0보다 커야 합니다"})
+				return
+			}
+			_, err := store.db.Exec("UPDATE users SET balance = balance + ? WHERE id = ?", request.Amount, user.ID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to update balance"})
+				return
+			}
+			updatedUser, _, err := store.findUserByUsername(user.Username)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to load updated user"})
+				return
+			}
+			sessions.tokens[token] = updatedUser
+
 			c.JSON(http.StatusOK, gin.H{
-				"message": "dummy deposit handler",
-				"todo":    "replace with balance increment query",
-				"user":    makeUserResponse(user),
+				"message": "입금 완료",
+				"user":    makeUserResponse(updatedUser),
 				"amount":  request.Amount,
 			})
 		})
@@ -281,10 +357,31 @@ func main() {
 				return
 			}
 
+			if request.Amount <= 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"message": "출금 금액은 0보다 커야 합니다"})
+				return
+			}
+
+			if user.Balance < request.Amount {
+				c.JSON(http.StatusBadRequest, gin.H{"message": "돈이 부족함"})
+				return
+			}
+
+			_, err := store.db.Exec("UPDATE users SET balance = balance - ? WHERE id = ?", request.Amount, user.ID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to update balance"})
+				return
+			}
+			updatedUser, _, err := store.findUserByUsername(user.Username)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to load updated user"})
+				return
+			}
+			sessions.tokens[token] = updatedUser
+
 			c.JSON(http.StatusOK, gin.H{
-				"message": "dummy withdraw handler",
-				"todo":    "replace with balance check and decrement query",
-				"user":    makeUserResponse(user),
+				"message": "출금 완료",
+				"user":    makeUserResponse(updatedUser),
 				"amount":  request.Amount,
 			})
 		})
@@ -307,10 +404,62 @@ func main() {
 				return
 			}
 
+			if user.Balance < request.Amount {
+				c.JSON(http.StatusBadRequest, gin.H{"message": "돈이 부족함"})
+				return
+			}
+
+			if request.Amount <= 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"message": "이체 금액은 0보다 커야 합니다"})
+				return
+			}
+
+			_, ok, err := store.findUserByUsername(request.ToUsername) // 반환값: 사용자, 있는지 여부, 에러 여부
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to load user"})
+				return
+			}
+			if !ok {
+				c.JSON(http.StatusUnauthorized, gin.H{"message": "그런 사용자 없음"})
+				return
+			}
+
+			// 시작
+			tx, err := store.db.Begin()
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to start transaction"})
+				return
+			}
+			defer tx.Rollback()
+
+			_, err = tx.Exec("UPDATE users SET balance = balance - ? WHERE id = ?", request.Amount, user.ID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to update sender balance"})
+				return
+			}
+
+			_, err = tx.Exec("UPDATE users SET balance = balance + ? WHERE username = ?", request.Amount, request.ToUsername)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to update recipient balance"})
+				return
+			}
+
+			err = tx.Commit()
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to commit transaction"})
+				return
+			}
+
+			updatedUser, _, err := store.findUserByUsername(user.Username)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to load updated user"})
+				return
+			}
+			sessions.tokens[token] = updatedUser
+
 			c.JSON(http.StatusOK, gin.H{
-				"message": "dummy transfer handler",
-				"todo":    "replace with transfer transaction and balance checks",
-				"user":    makeUserResponse(user),
+				"message": "송금이 완료됨",
+				"user":    makeUserResponse(updatedUser),
 				"target":  request.ToUsername,
 				"amount":  request.Amount,
 			})
@@ -327,19 +476,27 @@ func main() {
 				return
 			}
 
+			result, err := store.db.Query("SELECT id, title, content, owner_id, created_at, updated_at FROM posts")
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to query posts"})
+				return
+			}
+			defer result.Close()
+
+			var posts []PostView
+
+			for result.Next() {
+				var post PostView
+				err = result.Scan(&post.ID, &post.Title, &post.Content, &post.OwnerID, &post.CreatedAt, &post.UpdatedAt)
+				if err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to scan post"})
+					return
+				}
+				posts = append(posts, post)
+			}
+
 			c.JSON(http.StatusOK, PostListResponse{
-				Posts: []PostView{
-					{
-						ID:          1,
-						Title:       "Dummy Post",
-						Content:     "This is a fixed dummy response. Replace this later with real board logic.",
-						OwnerID:     1,
-						Author:      "Alice Admin",
-						AuthorEmail: "alice.admin@example.com",
-						CreatedAt:   "2026-03-19T09:00:00Z",
-						UpdatedAt:   "2026-03-19T09:00:00Z",
-					},
-				},
+				Posts: posts,
 			})
 		})
 
@@ -362,11 +519,31 @@ func main() {
 			}
 
 			now := time.Now().Format(time.RFC3339)
+
+			Title := strings.TrimSpace(request.Title)
+			Content := strings.TrimSpace(request.Content)
+			if Title == "" || Content == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"message": "title and content cannot be empty"})
+				return
+			}
+
+			_, err := store.db.Exec("INSERT INTO posts (title, content, owner_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)", Title, Content, user.ID, now, now)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to create post"})
+				return
+			}
+
+			var postID uint
+			err = store.db.QueryRow("SELECT last_insert_rowid()").Scan(&postID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to retrieve created post"})
+				return
+			}
+
 			c.JSON(http.StatusCreated, gin.H{
-				"message": "dummy create post handler",
-				"todo":    "replace with insert query",
+				"message": "게시글이 생성됨",
 				"post": PostView{
-					ID:          1,
+					ID:          postID,
 					Title:       strings.TrimSpace(request.Title),
 					Content:     strings.TrimSpace(request.Content),
 					OwnerID:     user.ID,
@@ -389,17 +566,20 @@ func main() {
 				return
 			}
 
+			var_id := c.Param("id")
+			var post PostView
+			err := store.db.QueryRow("SELECT id, title, content, owner_id, created_at, updated_at FROM posts WHERE id = ?", var_id).Scan(&post.ID, &post.Title, &post.Content, &post.OwnerID, &post.CreatedAt, &post.UpdatedAt)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					c.JSON(http.StatusNotFound, gin.H{"message": "post not found"})
+					return
+				}
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to query post"})
+				return
+			}
+
 			c.JSON(http.StatusOK, PostResponse{
-				Post: PostView{
-					ID:          1,
-					Title:       "Dummy Post",
-					Content:     "This is a fixed dummy response. Replace this later with real board logic.",
-					OwnerID:     1,
-					Author:      "Alice Admin",
-					AuthorEmail: "alice.admin@example.com",
-					CreatedAt:   "2026-03-19T09:00:00Z",
-					UpdatedAt:   "2026-03-19T09:00:00Z",
-				},
+				Post: post,
 			})
 		})
 
@@ -422,18 +602,35 @@ func main() {
 			}
 
 			now := time.Now().Format(time.RFC3339)
+
+			var ownerID uint
+			err := store.db.QueryRow("SELECT owner_id FROM posts WHERE id = ?", c.Param("id")).Scan(&ownerID)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					c.JSON(http.StatusNotFound, gin.H{"message": "post not found"})
+					return
+				}
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to query post owner"})
+				return
+			}
+			if ownerID != user.ID {
+				c.JSON(http.StatusForbidden, gin.H{"message": "당신은 이 게시글의 소유자가 아닙니다"})
+				return
+			}
+
+			_, err = store.db.Exec("UPDATE posts SET title = ?, content = ?, updated_at = ? WHERE id = ?", strings.TrimSpace(request.Title), strings.TrimSpace(request.Content), now, c.Param("id"))
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to update post"})
+				return
+			}
+
 			c.JSON(http.StatusOK, gin.H{
-				"message": "dummy update post handler",
-				"todo":    "replace with ownership check and update query",
+				"message": "수정 완료",
 				"post": PostView{
-					ID:          1,
-					Title:       strings.TrimSpace(request.Title),
-					Content:     strings.TrimSpace(request.Content),
-					OwnerID:     user.ID,
-					Author:      user.Name,
-					AuthorEmail: user.Email,
-					CreatedAt:   "2026-03-19T09:00:00Z",
-					UpdatedAt:   now,
+					Title:     strings.TrimSpace(request.Title),
+					Content:   strings.TrimSpace(request.Content),
+					OwnerID:   user.ID,
+					UpdatedAt: now,
 				},
 			})
 		})
@@ -449,9 +646,31 @@ func main() {
 				return
 			}
 
+			var ownerID uint
+			err := store.db.QueryRow("SELECT owner_id FROM posts WHERE id = ?", c.Param("id")).Scan(&ownerID)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					c.JSON(http.StatusNotFound, gin.H{"message": "post not found"})
+					return
+				}
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to query post owner"})
+				return
+			}
+
+			user_ID := sessions.tokens[token].ID
+			if ownerID != user_ID {
+				c.JSON(http.StatusForbidden, gin.H{"message": "당신은 이 게시글의 소유자가 아닙니다"})
+				return
+			}
+
+			_, err = store.db.Exec("DELETE FROM posts WHERE id = ?", c.Param("id"))
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to delete post"})
+				return
+			}
+
 			c.JSON(http.StatusOK, gin.H{
-				"message": "dummy delete post handler",
-				"todo":    "replace with ownership check and delete query",
+				"message": "삭제 완료",
 			})
 		})
 	}

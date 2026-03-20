@@ -1,0 +1,4 @@
+time="2026-03-20T16:40:28+09:00" level=info msg="서버 시작"
+time="2026-03-20T16:42:20+09:00" level=info msg="서버 시작"
+time="2026-03-20T16:42:26+09:00" level=info msg="요청 수신" ip="::1" method=POST path=/api/auth/login status=200
+time="2026-03-20T16:42:26+09:00" level=info msg="요청 수신" ip="::1" method=GET path=/api/posts status=200
